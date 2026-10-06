@@ -1,0 +1,1 @@
+console=serial0,115200 console=tty1 root=/dev/loop0 rootfstype=ext4 rootwait fsck.repair=no

@@ -1,0 +1,1061 @@
+#cloud-config
+# Première mise en service d'une boîte Allô Papa.
+# Le compte est créé par userconf.txt, pas ici : le module « users » de
+# cloud-init échoue sans bruit sur cette image.
+# Aucun paquet n'est installé : tout ce qu'il faut est déjà dans root.img,
+# et la boîte n'a pas de réseau chez une famille.
+
+hostname: allopapa
+manage_etc_hosts: true
+
+timezone: Europe/Paris
+keyboard:
+  model: pc105
+  layout: fr
+
+# SSH fermé, et jamais par mot de passe. allopapa-maintenance.service ne
+# l'ouvre, par clé, que si la carte porte allo-papa-maintenance.
+ssh_pwauth: false
+disable_root: true
+
+write_files:
+  - path: /home/mathias/allo_papa_enregistrement/preparer-au-demarrage.sh
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      #
+      # Le script système de la boîte, lancé en root par systemd.
+      #
+      #   preparer-au-demarrage.sh              allopapa-preparation.service
+      #       système hors ligne (systeme.zip), blocage des mises à jour du noyau,
+      #       puis installation d'une version déposée sur la carte (allo-papa.zip)
+      #   preparer-au-demarrage.sh donnees      allopapa-donnees.service
+      #       stockage des enregistrements hors de root.img, monté sur donnees/
+      #   preparer-au-demarrage.sh maintenance  allopapa-maintenance.service
+      #       SSH ouvert seulement si la carte porte « allo-papa-maintenance »
+      #   preparer-au-demarrage.sh erreur NOM   allopapa-erreur@.service
+      #       une annonce vocale quand un service a épuisé ses redémarrages
+      #
+      # C'est le mécanisme qui rend la boîte prête sans qu'on tape quoi que ce soit :
+      # le créateur sort la carte, la branche sur son ordinateur, le site y écrit
+      # `allo-papa.zip`, il remet la carte dans la boîte, et elle s'installe seule
+      # au démarrage suivant. La partition de démarrage est en FAT32 : c'est la
+      # seule du Raspberry que macOS et Windows savent lire et écrire.
+      #
+      # Chaque installation **remplace entièrement** le programme précédent, sans
+      # fusion. Mais jamais en l'effaçant d'abord : la nouvelle version est montée
+      # à côté (src.neuf), vérifiée, puis permutée (installer-boite.sh). Une
+      # installation ratée laisse l'ancien programme en place.
+      #
+      # Ce fichier est posé par cloud-init (user-data) au premier démarrage, puis
+      # remis à jour par chaque version (installer-boite.sh). Toute modification
+      # oblige à régénérer user-data : voir docs/code/SYSTEME-CARTE.md.
+
+      set -uo pipefail
+
+      DEMARRAGE="${ALLO_PAPA_FAT:-/boot/firmware}"
+      CIBLE="${ALLO_PAPA_CIBLE:-/home/mathias/allo_papa_enregistrement}"
+      UTILISATEUR="${ALLO_PAPA_UTILISATEUR:-mathias}"
+      DONNEES="$CIBLE/donnees"
+      JOURNAL="$CIBLE/preparation.log"
+
+      # Formats d'archive que cette boîte sait installer (VERSION.json et
+      # questions.json, champ format_version). Une version majeure inconnue est
+      # refusée, et la boîte le dit.
+      FORMAT_MAJEUR=1
+
+      # Stockage des enregistrements : root.img n'a que ~450 Mo libres.
+      ETIQUETTE=ALLOPAPA-DONNEES
+      MIN_PARTITION=$((2 * 1024 * 1024 * 1024))        # en dessous : image sur la FAT
+      # Plafond de la partition. Une fausse carte (« 256 Go » pour 52 réels, comme
+      # la carte de test) annonce un espace qu'elle n'a pas : écrire près de la
+      # fin annoncée écraserait le début de la carte. 8 Gio derrière la FAT, c'est
+      # plus de 30 heures de voix (brut + version livrée) et ça reste dans la
+      # capacité réelle de toute carte où la FAT elle-même tient.
+      MAX_PARTITION=$((8 * 1024 * 1024 * 1024))
+      MAX_IMAGE=$((3584 * 1024 * 1024))                 # 3,5 Gio, sous la limite FAT32 de 4 Gio
+      MIN_IMAGE=$((1024 * 1024 * 1024))
+      MARGE_FAT=$((1024 * 1024 * 1024))                 # place gardée pour les versions
+      IMAGE="$DEMARRAGE/donnees.img"
+      PROVISOIRE=/run/allopapa-donnees-neuf
+      GEOMETRIE="$CIBLE/.partition-donnees"             # partition créée par la boîte
+
+      # Seule clé admise quand la carte porte allo-papa-maintenance. Une clé
+      # publique n'est pas un secret ; elle ne sert à rien tant que SSH est fermé.
+      CLE_MAINTENANCE="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIATbaH/88vTybIjcJvx1mUfNiuIc1TY9Oy/xZ/AjcNR0 maintenance-allo-papa"
+      MAINTENANCE="$DEMARRAGE/allo-papa-maintenance"
+
+      # Vers le journal et la sortie d'erreur (journald), jamais la sortie
+      # standard : plusieurs fonctions rendent leur résultat par celle-ci.
+      noter() {
+        mkdir -p "$(dirname "$JOURNAL")" 2>/dev/null
+        echo "$(date '+%Y-%m-%d %H:%M:%S')  $*" | tee -a "$JOURNAL" >&2
+      }
+
+      # Une ligne par sujet dans allo-papa-etat.txt, sur la FAT : la seule trace
+      # lisible depuis l'ordinateur du créateur quand la boîte ne dit rien.
+      # Réécrit seulement si quelque chose change (une écriture FAT par démarrage
+      # serait de l'usure pour rien).
+      etat_fat() {
+        local sujet="$1"; shift
+        local fichier="$DEMARRAGE/allo-papa-etat.txt" autres nouveau
+        [ -d "$DEMARRAGE" ] || return 0
+        autres="$(grep -v "^$sujet :" "$fichier" 2>/dev/null || true)"
+        nouveau="$(printf '%s\n%s : %s\n' "$autres" "$sujet" "$*" | sed '/^$/d' | sort)"
+        [ "$nouveau" = "$(cat "$fichier" 2>/dev/null)" ] && return 0
+        printf '%s\n' "$nouveau" > "$fichier.partiel" 2>/dev/null && mv -f "$fichier.partiel" "$fichier"
+        sync
+      }
+
+      # La LED verte bat comme un cœur pendant les longues opérations du
+      # démarrage : sans écran ni son, c'est le seul signe que la boîte travaille.
+      LED=""
+      for L in /sys/class/leds/ACT /sys/class/leds/led0; do
+        if [ -w "$L/trigger" ]; then LED="$L"; break; fi
+      done
+      led_travail() { [ -n "$LED" ] && echo heartbeat > "$LED/trigger" 2>/dev/null; return 0; }
+      led_normale() { [ -n "$LED" ] && echo mmc0 > "$LED/trigger" 2>/dev/null; return 0; }
+
+      # annoncer <dossier programme> <nom d'invite> : joue une phrase en clair de
+      # l'archive dépliée (ou du programme installé), sans Python.
+      annoncer() {
+        local dossier
+        for dossier in "${1:-}" "$CIBLE/src"; do
+          [ -n "$dossier" ] || continue
+          if [ -f "$dossier/dire.sh" ] && [ -f "$dossier/invites/$2.wav" ]; then
+            bash "$dossier/dire.sh" "$dossier/invites/$2.wav" 2>/dev/null || true
+            return 0
+          fi
+        done
+      }
+
+      annoncer_echec() {
+        # D'abord le programme de l'archive (s'il a été déplié), sinon celui de la
+        # boîte : echec_installation.wav et dire.sh restent en clair au scellement.
+        local dossier
+        for dossier in "${1:-}" "$CIBLE/src"; do
+          [ -n "$dossier" ] || continue
+          if [ -f "$dossier/dire.sh" ] && [ -f "$dossier/invites/echec_installation.wav" ]; then
+            bash "$dossier/dire.sh" "$dossier/invites/echec_installation.wav" 2>/dev/null || true
+            return 0
+          fi
+        done
+      }
+
+      # ======================================================================
+      #  Stockage des enregistrements
+      # ======================================================================
+
+      # Nom de la partition N d'un disque : mmcblk0 → mmcblk0p2, sda → sda2.
+      nom_partition() {
+        case "$1" in
+          *[0-9]) echo "${1}p$2" ;;
+          *)      echo "$1$2" ;;
+        esac
+      }
+
+      # Sans udev (ou avant lui), le nœud /dev d'une partition neuve peut manquer.
+      noeud() {
+        local nom="$1" majmin
+        [ -b "/dev/$nom" ] && return 0
+        command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 2>/dev/null
+        [ -b "/dev/$nom" ] && return 0
+        majmin="$(cat "/sys/class/block/$nom/dev" 2>/dev/null)" || return 1
+        mknod "/dev/$nom" b "${majmin%%:*}" "${majmin##*:}" 2>/dev/null
+        [ -b "/dev/$nom" ]
+      }
+
+      # Renseigne PART_FAT (mmcblk0p1) et DISQUE (mmcblk0) d'après le montage de
+      # la FAT. La FAT doit être la partition 1.
+      situer_la_carte() {
+        local source
+        source="$(findmnt -n -o SOURCE --mountpoint "$DEMARRAGE" 2>/dev/null | head -n 1)"
+        case "$source" in /dev/*) ;; *) noter "stockage : FAT non montée sur $DEMARRAGE"; return 1 ;; esac
+        PART_FAT="$(basename "$source")"
+        [ -e "/sys/class/block/$PART_FAT/partition" ] || { noter "stockage : $source n'est pas une partition"; return 1; }
+        DISQUE="$(basename "$(dirname "$(readlink -f "/sys/class/block/$PART_FAT")")")"
+        [ -e "/sys/class/block/$DISQUE/size" ] || { noter "stockage : disque de $source introuvable"; return 1; }
+        [ "$(cat "/sys/class/block/$PART_FAT/partition")" = 1 ] || { noter "stockage : la FAT n'est pas la partition 1"; return 1; }
+        return 0
+      }
+
+      etiquette_de() { blkid -p -o value -s LABEL "$1" 2>/dev/null || true; }
+      type_de()      { blkid -p -o value -s TYPE "$1" 2>/dev/null || true; }
+
+      # Une partition ext4 ALLOPAPA-DONNEES sur le disque de la FAT. Jamais
+      # reformatée : on la reprend telle quelle.
+      partition_existante() {
+        local chemin nom
+        for chemin in /sys/class/block/"$DISQUE"/"$DISQUE"*; do
+          [ -e "$chemin/partition" ] || continue
+          nom="$(basename "$chemin")"
+          [ "$nom" = "$PART_FAT" ] && continue
+          noeud "$nom" || continue
+          if [ "$(type_de "/dev/$nom")" = ext4 ] && [ "$(etiquette_de "/dev/$nom")" = "$ETIQUETTE" ]; then
+            echo "/dev/$nom"
+            return 0
+          fi
+        done
+        return 1
+      }
+
+      formater() {
+        # -m 1 : 1 % réservé à root suffit ; le programme tourne sous mathias.
+        mkfs.ext4 -q -F -L "$ETIQUETTE" -m 1 "$1" >>"$JOURNAL" 2>&1
+      }
+
+      # Partition créée par la boîte lors d'un démarrage précédent, mais que le
+      # noyau ne voyait pas encore à ce moment-là : elle porte notre géométrie
+      # notée, et aucun système de fichiers. On la formate maintenant.
+      partition_a_finir() {
+        local nom debut taille
+        [ -f "$GEOMETRIE" ] || return 1
+        read -r debut taille < "$GEOMETRIE" || return 1
+        nom="$(nom_partition "$DISQUE" 2)"
+        [ -e "/sys/class/block/$nom/start" ] || return 1
+        [ "$(cat "/sys/class/block/$nom/start")" = "$debut" ] || return 1
+        [ "$(cat "/sys/class/block/$nom/size")" = "$taille" ] || return 1
+        noeud "$nom" || return 1
+        if [ -n "$(type_de "/dev/$nom")" ]; then
+          # Quelque chose y est déjà écrit : on n'efface rien qu'on n'a pas créé.
+          [ "$(etiquette_de "/dev/$nom")" = "$ETIQUETTE" ] && { echo "/dev/$nom"; return 0; }
+          noter "stockage : la partition $nom porte déjà un autre système de fichiers, on n'y touche pas"
+          return 1
+        fi
+        noter "stockage : formatage de la partition de données $nom"
+        formater "/dev/$nom" || return 1
+        echo "/dev/$nom"
+      }
+
+      # Espace non partitionné derrière la FAT (table MBR, une seule partition) :
+      # partition 2, ext4, jamais au-delà de la fin de carte annoncée par le noyau.
+      creer_partition() {
+        local table nb secteurs debut_fat fin_fat debut dispo taille nom
+        table="$(blkid -p -o value -s PTTYPE "/dev/$DISQUE" 2>/dev/null || true)"
+        [ "$table" = dos ] || { noter "stockage : table de partitions « $table », pas MBR"; return 1; }
+        nb="$(sfdisk -d "/dev/$DISQUE" 2>/dev/null | grep -c 'start=' || true)"
+        if [ "$nb" != 1 ]; then
+          noter "stockage : la carte a $nb partitions, aucune n'est ALLOPAPA-DONNEES ; on n'en crée pas"
+          return 1
+        fi
+        secteurs="$(cat "/sys/class/block/$DISQUE/size")"            # en secteurs de 512 octets
+        debut_fat="$(cat "/sys/class/block/$PART_FAT/start")"
+        fin_fat=$((debut_fat + $(cat "/sys/class/block/$PART_FAT/size")))
+        debut=$(( (fin_fat + 2047) / 2048 * 2048 ))                    # aligné sur 1 Mio
+        dispo=$(( secteurs - 2048 - debut ))                           # 1 Mio de garde en fin
+        if [ "$dispo" -lt $((MIN_PARTITION / 512)) ]; then
+          noter "stockage : $((dispo > 0 ? dispo / 2048 : 0)) Mo libres derrière la FAT, moins de 2 Go"
+          return 1
+        fi
+        taille="$dispo"
+        [ "$taille" -gt $((MAX_PARTITION / 512)) ] && taille=$((MAX_PARTITION / 512))
+        taille=$(( taille / 2048 * 2048 ))
+        if [ $((debut + taille)) -gt "$secteurs" ] || [ "$debut" -lt "$fin_fat" ]; then
+          noter "stockage : calcul de partition incohérent ($debut + $taille > $secteurs), abandon"
+          return 1
+        fi
+        nom="$(nom_partition "$DISQUE" 2)"
+        noter "stockage : création de $nom, $((taille / 2048)) Mo à partir du secteur $debut (carte : $((secteurs / 2048)) Mo annoncés)"
+        # La géométrie est notée AVANT d'écrire la table : si le noyau ne voit pas
+        # la partition tout de suite, le démarrage suivant saura qu'elle est à nous.
+        printf '%s %s\n' "$debut" "$taille" > "$GEOMETRIE"; sync
+        if ! printf 'start=%s, size=%s, type=83\n' "$debut" "$taille" | \
+             sfdisk --append --no-reread --no-tell-kernel -q "/dev/$DISQUE" >>"$JOURNAL" 2>&1; then
+          noter "stockage : sfdisk a échoué"
+          rm -f "$GEOMETRIE"
+          return 1
+        fi
+        sync
+        # La FAT est montée : le noyau refuse de relire toute la table. On lui
+        # déclare la seule partition ajoutée (BLKPG), ce qu'il accepte.
+        [ -e "/sys/class/block/$nom" ] || addpart "/dev/$DISQUE" 2 "$debut" "$taille" >>"$JOURNAL" 2>&1
+        [ -e "/sys/class/block/$nom" ] || partprobe "/dev/$DISQUE" >>"$JOURNAL" 2>&1
+        if [ ! -e "/sys/class/block/$nom" ]; then
+          noter "stockage : partition écrite, le noyau la verra au prochain démarrage"
+          return 2
+        fi
+        partition_a_finir
+      }
+
+      # Carte entièrement FAT (carte d'usine) : un fichier image ext4 sur la FAT.
+      creer_image() {
+        local libre taille
+        libre="$(df -B1 --output=avail "$DEMARRAGE" 2>/dev/null | tail -n 1 | tr -d ' ')"
+        [ -n "$libre" ] || return 1
+        taille=$(( libre - MARGE_FAT ))
+        [ "$taille" -gt "$MAX_IMAGE" ] && taille="$MAX_IMAGE"
+        taille=$(( taille / 1048576 * 1048576 ))
+        if [ "$taille" -lt "$MIN_IMAGE" ]; then
+          noter "stockage : $((libre / 1048576)) Mo libres sur la FAT, pas assez pour une image de données"
+          return 1
+        fi
+        noter "stockage : création de $IMAGE ($((taille / 1048576)) Mo), plusieurs minutes sur une carte lente"
+        rm -f "$IMAGE.partiel"
+        led_travail
+        # La FAT n'a pas de fichiers creux : le noyau écrit les zéros, une fois.
+        if ! fallocate -l "$taille" "$IMAGE.partiel" 2>>"$JOURNAL"; then
+          dd if=/dev/zero of="$IMAGE.partiel" bs=1M count=$((taille / 1048576)) conv=fsync status=none 2>>"$JOURNAL" \
+            || { led_normale; rm -f "$IMAGE.partiel"; noter "stockage : image impossible à créer"; return 1; }
+        fi
+        if ! formater "$IMAGE.partiel"; then
+          led_normale; rm -f "$IMAGE.partiel"; noter "stockage : formatage de l'image impossible"; return 1
+        fi
+        sync
+        mv "$IMAGE.partiel" "$IMAGE" && sync
+        led_normale
+        echo "$IMAGE"
+      }
+
+      # Recopie ce qui était dans root.img (boîte déjà installée), vérifie, puis
+      # libère root.img. Reprenable : une coupure à n'importe quel moment laisse
+      # soit l'ancien contenu intact, soit une copie vérifiée.
+      migrer() {
+        local source="$1" cible="$2" differents restes
+        noter "stockage : reprise des données de root.img ($(du -sh "$source" 2>/dev/null | cut -f1))"
+        # Rien d'existant n'est écrasé : sur une partition déjà en service, ce
+        # qu'elle porte fait foi.
+        if ! rsync -aH --ignore-existing "$source/" "$cible/" >>"$JOURNAL" 2>&1; then
+          noter "stockage : copie impossible (place ?), les données restent dans root.img"
+          return 1
+        fi
+        sync
+        # Vérification au contenu (somme de contrôle) : tout fichier de root.img
+        # doit exister à l'identique sur le nouveau stockage.
+        differents="$(rsync -aHn --checksum --out-format='%n' "$source/" "$cible/" 2>>"$JOURNAL" | grep -v '/$' || true)"
+        if [ -n "$differents" ]; then
+          # Même nom, contenu différent : rien n'est perdu, l'ancien est mis de côté.
+          restes="$cible/.restes-root-$(date +%Y%m%d-%H%M%S)"
+          noter "stockage : $(printf '%s\n' "$differents" | wc -l) fichier(s) différent(s), anciens gardés dans $(basename "$restes")"
+          if ! rsync -aH "$source/" "$restes/" >>"$JOURNAL" 2>&1 || \
+             [ -n "$(rsync -aHn --checksum --out-format='%n' "$source/" "$restes/" 2>/dev/null | grep -v '/$' || true)" ]; then
+            noter "stockage : mise de côté non vérifiée, les données restent aussi dans root.img"
+            return 1
+          fi
+        fi
+        sync
+        # Tout est vérifié ailleurs : on libère root.img. Garde-fous : jamais sur
+        # un point de montage, jamais sur un chemin vide.
+        if [ -n "$source" ] && [ "$source" != / ] && ! mountpoint -q "$source"; then
+          find "$source" -mindepth 1 -delete 2>>"$JOURNAL"
+        fi
+        echo "$(date '+%Y-%m-%d %H:%M:%S') données reprises de root.img" >> "$cible/.allopapa-donnees"
+        sync
+        noter "stockage : données reprises et vérifiées, root.img libéré"
+      }
+
+      monter_donnees() {
+        local peripherique="$1" options=noatime rc
+        case "$peripherique" in *.img) options=loop,noatime ;; esac
+        e2fsck -p "$peripherique" >>"$JOURNAL" 2>&1; rc=$?
+        if [ "$rc" -ge 4 ]; then
+          noter "stockage : réparation automatique refusée (code $rc), réparation forcée"
+          e2fsck -y "$peripherique" >>"$JOURNAL" 2>&1; rc=$?
+          if [ "$rc" -ge 4 ]; then
+            noter "stockage : $peripherique irréparable (code $rc), données laissées dans root.img"
+            return 1
+          fi
+        fi
+        mkdir -p "$PROVISOIRE"
+        mountpoint -q "$PROVISOIRE" && umount "$PROVISOIRE"
+        if ! mount -t ext4 -o "$options" "$peripherique" "$PROVISOIRE" 2>>"$JOURNAL"; then
+          noter "stockage : montage de $peripherique impossible"
+          return 1
+        fi
+        [ -f "$PROVISOIRE/.allopapa-donnees" ] || \
+          echo "$(date '+%Y-%m-%d %H:%M:%S') stockage Allô Papa créé ($peripherique)" > "$PROVISOIRE/.allopapa-donnees"
+        if [ -n "$(ls -A "$DONNEES" 2>/dev/null)" ]; then
+          if ! migrer "$DONNEES" "$PROVISOIRE"; then
+            umount "$PROVISOIRE"
+            return 1
+          fi
+        fi
+        umount "$PROVISOIRE" || return 1
+        # Point de montage définitif. (Un « mount --move » est refusé sous /run,
+        # montage partagé : on remonte, c'est instantané.)
+        if ! mount -t ext4 -o "$options" "$peripherique" "$DONNEES" 2>>"$JOURNAL"; then
+          noter "stockage : montage sur $DONNEES impossible"
+          return 1
+        fi
+        mkdir -p "$DONNEES/reponses" "$DONNEES/brut"
+        chown "$UTILISATEUR:$UTILISATEUR" "$DONNEES" "$DONNEES/reponses" "$DONNEES/brut" 2>/dev/null
+        return 0
+      }
+
+      preparer_donnees() {
+        local peripherique="" rc
+        mkdir -p "$DONNEES"
+        if mountpoint -q "$DONNEES"; then
+          noter "stockage : déjà monté"
+          return 0
+        fi
+        situer_la_carte || return 1
+
+        # 1. une partition de données existe déjà
+        peripherique="$(partition_existante)" || peripherique=""
+        # 2. une partition créée par un démarrage précédent, pas encore formatée
+        [ -n "$peripherique" ] || peripherique="$(partition_a_finir)" || peripherique=""
+        # 3. une image de données existe déjà sur la FAT
+        if [ -z "$peripherique" ] && [ -f "$IMAGE" ]; then
+          if [ "$(type_de "$IMAGE")" = ext4 ] && [ "$(etiquette_de "$IMAGE")" = "$ETIQUETTE" ]; then
+            peripherique="$IMAGE"
+          else
+            noter "stockage : $IMAGE n'est pas une image de données Allô Papa, on n'y touche pas"
+          fi
+        fi
+        # 4. créer une partition derrière la FAT, sinon 5. une image sur la FAT
+        if [ -z "$peripherique" ] && [ ! -f "$IMAGE" ]; then
+          peripherique="$(creer_partition)"; rc=$?
+          if [ "$rc" = 2 ]; then
+            # Table écrite mais invisible pour le noyau : surtout pas d'image en
+            # plus. Ce démarrage reste sur root.img, le suivant finira.
+            etat_fat stockage "partition créée, prise en compte au prochain démarrage"
+            return 1
+          fi
+          [ "$rc" = 0 ] || peripherique=""
+          [ -n "$peripherique" ] || peripherique="$(creer_image)" || peripherique=""
+        fi
+
+        if [ -z "$peripherique" ]; then
+          noter "stockage : aucun stockage de données, les enregistrements restent dans root.img"
+          etat_fat stockage "aucun (enregistrements dans le système, place limitée)"
+          # Les voix vivent alors dans root.img, dont 5 % sont réservés à root par
+          # défaut : le programme (compte mathias) n'y a pas accès et annonçait
+          # « carte pleine » sur une carte de 4 Go (06/10). On ramène la réserve à 1 %.
+          tune2fs -m 1 "$(findmnt -n -o SOURCE /)" >/dev/null 2>&1 || true
+          # Situation prévue (carte trop petite), pas une panne : le service ne
+          # doit pas apparaître en échec. La boîte fonctionne, avec moins de place.
+          return 0
+        fi
+        if ! monter_donnees "$peripherique"; then
+          etat_fat stockage "échec du montage de $(basename "$peripherique")"
+          return 1
+        fi
+        noter "stockage : $peripherique monté sur $DONNEES ($(df -h --output=avail "$DONNEES" | tail -n 1 | tr -d ' ') libres)"
+        case "$peripherique" in
+          *.img) etat_fat stockage "image donnees.img sur la carte" ;;
+          *)     etat_fat stockage "partition $ETIQUETTE" ;;
+        esac
+        return 0
+      }
+
+      # ======================================================================
+      #  Maintenance (SSH)
+      # ======================================================================
+
+      maintenance() {
+        local conf=/etc/ssh/sshd_config.d/00-allopapa.conf
+        local maison cles
+        maison="$(getent passwd "$UTILISATEUR" | cut -d: -f6)"
+        [ -n "$maison" ] || maison="/home/$UTILISATEUR"
+        cles="$maison/.ssh/authorized_keys"
+
+        # Clé seulement, jamais de mot de passe, jamais root. Le premier fichier
+        # lu l'emporte dans sshd : d'où le préfixe 00.
+        if [ -d /etc/ssh/sshd_config.d ]; then
+          cat > "$conf.neuf" <<'SSHD'
+      # Allô Papa : accès de maintenance par clé uniquement.
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+      PubkeyAuthentication yes
+      AuthenticationMethods publickey
+      SSHD
+          if cmp -s "$conf.neuf" "$conf"; then rm -f "$conf.neuf"; else mv -f "$conf.neuf" "$conf"; fi
+        fi
+
+        # Mot de passe du compte inutilisable (« * ») : plus de mot de passe
+        # commun à toutes les boîtes. La clé SSH reste acceptée.
+        if [ "$(getent shadow "$UTILISATEUR" | cut -d: -f2)" != "*" ]; then
+          usermod -p '*' "$UTILISATEUR" && noter "maintenance : mot de passe du compte désactivé"
+        fi
+
+        if [ -f "$MAINTENANCE" ]; then
+          install -d -m 0700 -o "$UTILISATEUR" -g "$UTILISATEUR" "$maison/.ssh"
+          printf '%s\n' "$CLE_MAINTENANCE" > "$cles.neuf"
+          chown "$UTILISATEUR:$UTILISATEUR" "$cles.neuf"; chmod 0600 "$cles.neuf"
+          mv -f "$cles.neuf" "$cles"
+          # sudo sans mot de passe : le compte n'en a plus, et la maintenance a
+          # besoin des droits. Rien d'autre dans la boîte n'utilise sudo (les
+          # services tournent déjà en root quand il le faut).
+          printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$UTILISATEUR" > /etc/sudoers.d/.010-allopapa-maintenance
+          chmod 0440 /etc/sudoers.d/.010-allopapa-maintenance
+          if visudo -cqf /etc/sudoers.d/.010-allopapa-maintenance; then
+            mv -f /etc/sudoers.d/.010-allopapa-maintenance /etc/sudoers.d/010-allopapa-maintenance
+          else
+            rm -f /etc/sudoers.d/.010-allopapa-maintenance
+          fi
+          ssh-keygen -A >/dev/null 2>&1
+          systemctl enable ssh.service >/dev/null 2>&1
+          # --no-block : ce service est ordonné avant ssh, l'attendre serait une
+          # attente circulaire.
+          systemctl start --no-block ssh.service >/dev/null 2>&1
+          noter "maintenance : carte de maintenance, SSH ouvert (clé uniquement)"
+          etat_fat maintenance "SSH ouvert (clé de maintenance uniquement)"
+        else
+          systemctl disable ssh.service ssh.socket >/dev/null 2>&1
+          systemctl stop --no-block ssh.service ssh.socket >/dev/null 2>&1
+          rm -f "$cles" /etc/sudoers.d/010-allopapa-maintenance \
+                /etc/sudoers.d/010-"$UTILISATEUR"-nopasswd /etc/sudoers.d/010_pi-nopasswd
+          etat_fat maintenance "fermé"
+        fi
+        return 0
+      }
+
+      # ======================================================================
+      #  Préparation : système hors ligne, noyau figé, version
+      # ======================================================================
+
+      # Une installation interrompue ne doit jamais laisser une boîte sans
+      # programme : si src/ manque et que l'ancien est là, on le remet.
+      reprendre_src() {
+        if [ ! -f "$CIBLE/src/lanceur.py" ] && [ -f "$CIBLE/src.ancien/lanceur.py" ]; then
+          rm -rf "$CIBLE/src.echec"
+          [ -e "$CIBLE/src" ] && mv "$CIBLE/src" "$CIBLE/src.echec"
+          mv "$CIBLE/src.ancien" "$CIBLE/src" && noter "programme précédent rétabli"
+          sync
+        fi
+        rm -rf "$CIBLE/src.neuf" "$CIBLE/src.echec" "$CIBLE"/.installation.* 2>/dev/null
+        return 0
+      }
+
+      # systeme.zip (modèle Vosk + bibliothèques) déplié dans un dossier
+      # provisoire, vérifié, puis mis en place ; le témoin porte la taille de
+      # l'archive dépliée. Sans témoin, ou si l'archive a changé, on refait.
+      deplier_systeme() {
+        local archive="$DEMARRAGE/systeme.zip" temoin="$CIBLE/.systeme-deplie"
+        local neuf="$CIBLE/.systeme.neuf" attendu d
+        if [ ! -f "$archive" ]; then
+          [ -d "$CIBLE/paquets" ] || noter "systeme.zip absent de la carte : pas de système hors ligne"
+          return 0
+        fi
+        attendu="$(stat -c %s "$archive")"
+        if [ "$(cat "$temoin" 2>/dev/null)" = "$attendu" ] && [ -d "$CIBLE/paquets" ] && [ -d "$CIBLE/modele" ]; then
+          return 0
+        fi
+        noter "mise en place du système hors ligne"
+        led_travail
+        rm -rf "$neuf"; mkdir -p "$neuf"
+        if ! unzip -q -o "$archive" -d "$neuf" >>"$JOURNAL" 2>&1; then
+          led_normale; rm -rf "$neuf"
+          noter "systeme.zip illisible, système hors ligne non mis en place"
+          return 1
+        fi
+        if [ ! -d "$neuf/paquets/vosk" ] || [ ! -d "$neuf/modele" ]; then
+          led_normale; rm -rf "$neuf"
+          noter "systeme.zip incomplet (paquets/vosk ou modele manquant)"
+          return 1
+        fi
+        chown -R "$UTILISATEUR:$UTILISATEUR" "$neuf" 2>/dev/null
+        sync
+        for d in paquets modele; do
+          rm -rf "$CIBLE/$d.ancien"
+          [ -e "$CIBLE/$d" ] && mv "$CIBLE/$d" "$CIBLE/$d.ancien"
+          mv "$neuf/$d" "$CIBLE/$d"
+        done
+        sync
+        printf '%s\n' "$attendu" > "$temoin.partiel" && sync && mv -f "$temoin.partiel" "$temoin"
+        sync
+        rm -rf "$CIBLE/paquets.ancien" "$CIBLE/modele.ancien" "$neuf"
+        led_normale
+        noter "système en place, aucune connexion ne sera nécessaire"
+      }
+
+      # Une mise à jour du noyau régénérerait initramfs8 sur la FAT, et la boîte
+      # ne démarrerait plus si le crochet allopapa y manquait. On fige le noyau,
+      # l'amorce et le firmware ; l'amorce n'est plus régénérée automatiquement.
+      bloquer_noyau() {
+        local paquets a_figer conf=/etc/initramfs-tools/update-initramfs.conf
+        if command -v apt-mark >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1; then
+          paquets="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image*' \
+                       initramfs-tools initramfs-tools-core raspi-firmware 2>/dev/null \
+                     | awk '$1 == "ii" {print $2}' || true)"
+          a_figer="$(comm -23 <(printf '%s\n' "$paquets" | sed '/^$/d' | sort) \
+                              <(apt-mark showhold 2>/dev/null | sort) || true)"
+          if [ -n "$a_figer" ]; then
+            # shellcheck disable=SC2086
+            apt-mark hold $a_figer >/dev/null 2>&1 && noter "mises à jour figées : $(echo $a_figer)"
+          fi
+        fi
+        if [ -f "$conf" ] && grep -q '^update_initramfs=yes' "$conf"; then
+          sed -i 's/^update_initramfs=yes/update_initramfs=no/' "$conf"
+        fi
+        return 0
+      }
+
+      # format_version de VERSION.json ou questions.json : absent = ancien site,
+      # accepté ; majeure différente de FORMAT_MAJEUR = refusé.
+      format_acceptable() {
+        python3 - "$1" "$FORMAT_MAJEUR" <<'PY'
+      import json, sys
+      try:
+          with open(sys.argv[1], encoding="utf-8") as fichier:
+              valeur = json.load(fichier).get("format_version")
+      except (OSError, ValueError, AttributeError) as erreur:
+          print(f"illisible ({erreur})")
+          sys.exit(1)
+      if valeur is None:
+          sys.exit(0)
+      try:
+          majeure = int(str(valeur).split(".")[0])
+      except ValueError:
+          majeure = -1
+      if majeure != int(sys.argv[2]):
+          print(f"format {valeur}, cette boîte sait installer le format {sys.argv[2]}")
+          sys.exit(1)
+      PY
+      }
+
+      refuser() {
+        local raison="$1" programme="${2:-}"
+        noter "version refusée : $raison"
+        # Renommée, pas effacée : le créateur peut la reprendre. Plus de
+        # tentative à chaque démarrage (et plus d'annonce à chaque allumage).
+        mv -f "$ARCHIVE" "$ARCHIVE.refusee" 2>/dev/null
+        sync
+        etat_fat installation "refusée : $raison"
+        annoncer_echec "$programme"
+      }
+
+      installer_version() {
+        local candidat installateur raison programme_archive f
+        ARCHIVE=""
+        for candidat in "$DEMARRAGE"/allo-papa.zip "$DEMARRAGE"/allo-papa-*.zip; do
+          [ -e "$candidat" ] || continue
+          # allo-papa-transfert*.json et leurs réponses ne sont pas des .zip :
+          # ils ne sont jamais touchés ici (le coffre les traite).
+          case "$candidat" in *.installe.zip) rm -f "$candidat"; continue ;; esac
+          ARCHIVE="$candidat"
+          break
+        done
+        [ -n "$ARCHIVE" ] || return 0
+
+        noter "version trouvée sur la carte : $(basename "$ARCHIVE")"
+        TEMP="$(mktemp -d "$CIBLE/.installation.XXXXXX")" || { noter "dossier provisoire impossible"; return 1; }
+        trap 'rm -rf "$TEMP"' EXIT
+
+        if ! unzip -q "$ARCHIVE" -d "$TEMP" >>"$JOURNAL" 2>&1; then
+          # Rien de ce qui a été déplié n'est digne de confiance : on parle avec
+          # le programme déjà installé.
+          refuser "archive illisible (incomplète ou abîmée)"
+          return 0
+        fi
+        installateur="$TEMP/allo-papa/installer-boite.sh"
+        programme_archive="$TEMP/allo-papa/programme"
+        if [ ! -f "$installateur" ] || [ ! -f "$TEMP/allo-papa/VERSION.json" ]; then
+          refuser "ce n'est pas une version Allô Papa" "$programme_archive"
+          return 0
+        fi
+        for f in VERSION.json questions.json; do
+          [ -f "$TEMP/allo-papa/$f" ] || continue
+          if ! raison="$(format_acceptable "$TEMP/allo-papa/$f")"; then
+            refuser "$f : $raison" "$programme_archive"
+            return 0
+          fi
+        done
+
+        # L'installation et le scellement durent plusieurs minutes sans rien dire :
+        # on prévient à voix haute, et la LED bat jusqu'à la fin (06/10 : sans ce
+        # signe, la boîte paraissait en panne et on l'aurait débranchée).
+        annoncer "$programme_archive" installation_en_cours
+        led_travail
+
+        # installer-boite.sh monte la version dans src.neuf et ne permute qu'une
+        # fois tout vérifié : l'ancien programme reste en place jusque-là.
+        if ALLO_PAPA_CIBLE="$CIBLE" ALLO_PAPA_MODELE="$CIBLE/modele" \
+             bash "$installateur" >>"$JOURNAL" 2>&1 && [ -f "$CIBLE/src/lanceur.py" ]; then
+          led_normale
+          noter "installation réussie"
+          # L'archive est effacée, pas seulement renommée : la FAT se lit sur
+          # n'importe quel ordinateur, y laisser la version, c'était y laisser en
+          # clair le programme et les questions. Le créateur garde l'original.
+          rm -f "$ARCHIVE" "${ARCHIVE%.zip}.installe.zip" 2>/dev/null
+          sync
+          etat_fat installation "version $(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("version","?"))' "$CIBLE/VERSION.json" 2>/dev/null) installée"
+        else
+          led_normale
+          noter "l'installation a échoué, voir ci-dessus ; le programme précédent est gardé"
+          reprendre_src
+          etat_fat installation "échec, programme précédent gardé (détails : preparation.log)"
+          # L'archive reste : le démarrage suivant retentera. Et la boîte le dit :
+          # sans cette phrase, un échec est indiscernable d'une boîte éteinte.
+          annoncer_echec "$programme_archive"
+        fi
+      }
+
+      # Ce que le coffre doit faire en root avant que le programme démarre :
+      # traiter allo-papa-transfert-reponse.json déposé par l'atelier, rechiffrer
+      # les voix d'une boîte remplacée, déposer allo-papa-transfert.json, noter
+      # l'origine. Le lanceur, sous mathias, ne peut ni rechiffrer src/ ni écrire
+      # tout cela. FAT montée en écriture et données montées à ce moment-là
+      # (ordre des services). Code 3 = carte d'une autre boîte : ce n'est pas un
+      # échec de la préparation, le lanceur le dira.
+      coffre_au_demarrage() {
+        [ -f "$CIBLE/src/coffre.py" ] || return 0
+        python3 "$CIBLE/src/coffre.py" demarrage "$CIBLE/src" "$DONNEES" "$DEMARRAGE" >>"$JOURNAL" 2>&1 || true
+        chown -R "$UTILISATEUR:$UTILISATEUR" "$DONNEES" 2>/dev/null
+        return 0
+      }
+
+      # Volume des sorties à 90 % à chaque démarrage. Une carte son USB démarre
+      # souvent bas (l'AB13X était à 56 %, presque inaudible), et chez le client
+      # personne ne réglera un mélangeur. On touche aux réglages de lecture usuels
+      # de toutes les cartes, sans erreur si un réglage n'existe pas ; les micros
+      # (« Mic », « Capture ») ne sont pas concernés.
+      regler_volume() {
+        command -v amixer >/dev/null 2>&1 || return 0
+        local n reglage
+        for n in $(sed -nE 's/^ *([0-9]+) \[.*/\1/p' /proc/asound/cards 2>/dev/null); do
+          for reglage in Master PCM Speaker Headphone "Speaker Playback" "PCM Playback"; do
+            amixer -q -c "$n" sset "$reglage" 90% unmute >/dev/null 2>&1 || true
+          done
+        done
+        noter "volume : sorties réglées à 90 %"
+      }
+
+      preparer() {
+        mkdir -p "$CIBLE"
+        regler_volume
+        reprendre_src
+        deplier_systeme
+        bloquer_noyau
+        installer_version
+        coffre_au_demarrage
+        return 0
+      }
+
+      case "${1:-preparer}" in
+        preparer)    preparer ;;
+        donnees)     preparer_donnees ;;
+        maintenance) maintenance ;;
+        erreur)
+          noter "le service ${2:-?} s'est arrêté après trop d'échecs successifs"
+          etat_fat erreur "${2:-?} arrêté après trop d'échecs"
+          annoncer_echec ""
+          ;;
+        *) echo "usage : $0 [preparer|donnees|maintenance|erreur NOM]" >&2; exit 2 ;;
+      esac
+  - path: /etc/systemd/system/allopapa-preparation.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Allo Papa - installe une version deposee sur la carte
+      After=local-fs.target boot-firmware.mount allopapa-donnees.service
+      Wants=allopapa-donnees.service
+      RequiresMountsFor=/boot/firmware
+      Before=allopapa-boite.service allopapa-enregistrement.service
+      # Un echec imprevu (delai depasse, script interrompu) se dit a voix haute.
+      # Les echecs d'installation, eux, sont annonces par le script lui-meme.
+      OnFailure=allopapa-erreur@%N.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=no
+      # Une preparation qui s'eternise ne doit pas retenir la boite pour toujours :
+      # au pire elle demarre sans la nouvelle version, ce qui se voit et se repare.
+      # Une heure : la premiere mise en place du stockage de donnees peut etre
+      # longue sur une carte lente, et un transfert vers un Raspberry de
+      # remplacement (coffre.py demarrage) rechiffre toutes les voix. Les deux
+      # sont reprenables au demarrage suivant si le delai est depasse.
+      TimeoutStartSec=3600
+      ExecStart=/home/mathias/allo_papa_enregistrement/preparer-au-demarrage.sh
+      # L'installation ecrit dans /boot/firmware et declare des services : il lui
+      # faut les droits.
+      User=root
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/allopapa-donnees.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Allo Papa - stockage des enregistrements (partition ou image de donnees)
+      # La FAT doit etre montee : l'image donnees.img y vit, et c'est d'elle qu'on
+      # deduit la carte ou creer la partition.
+      After=local-fs.target boot-firmware.mount
+      RequiresMountsFor=/boot/firmware
+      # Les enregistrements doivent etre en place avant tout programme qui les lit
+      # ou les ecrit.
+      Before=allopapa-preparation.service allopapa-boite.service allopapa-enregistrement.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      # Creer l'image de donnees sur une carte lente peut prendre longtemps (une
+      # seule fois) : pas de delai maximal. La LED bat pendant ce temps.
+      TimeoutStartSec=infinity
+      ExecStart=/home/mathias/allo_papa_enregistrement/preparer-au-demarrage.sh donnees
+      User=root
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/allopapa-maintenance.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Allo Papa - acces de maintenance (SSH) selon la carte
+      # SSH est ferme par defaut. Il n'est ouvert, par cle uniquement, que si la
+      # carte porte le fichier allo-papa-maintenance. On passe apres sshswitch
+      # (fichier « ssh » de Raspberry Pi OS) pour avoir le dernier mot.
+      After=boot-firmware.mount sshswitch.service regenerate_ssh_host_keys.service
+      RequiresMountsFor=/boot/firmware
+      Before=ssh.service ssh.socket
+
+      [Service]
+      Type=oneshot
+      ExecStart=/home/mathias/allo_papa_enregistrement/preparer-au-demarrage.sh maintenance
+      User=root
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/allopapa-erreur@.service
+    permissions: '0644'
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Allo Papa - annonce vocale apres l'abandon de %i
+      # Declenche par OnFailure= des services de la boite, une fois leurs
+      # redemarrages epuises (StartLimitBurst) : une seule annonce, au lieu d'une
+      # boite muette qui redemarre en boucle sans que personne ne le sache.
+
+      [Service]
+      Type=oneshot
+      ExecStart=/home/mathias/allo_papa_enregistrement/preparer-au-demarrage.sh erreur %i
+      User=root
+  - path: /etc/initramfs-tools/scripts/local-top/allopapa
+    permissions: '0755'
+    owner: root:root
+    content: |
+      #!/bin/sh
+      # Allô Papa : la racine du système vit dans un fichier posé sur la partition
+      # FAT de la carte, et non sur une partition Linux.
+      #
+      # Pourquoi : une carte qui sort de l'emballage n'a qu'une partition FAT. Un
+      # navigateur sait y écrire des fichiers, il ne sait pas partitionner. En
+      # mettant le système dans un fichier, la préparation d'une boîte redevient
+      # une simple copie de fichiers.
+      #
+      # Ce script s'exécute avant que l'initramfs ne cherche la racine : il monte
+      # la partition FAT, y accroche le fichier système sur /dev/loop0, et laisse
+      # le mécanisme habituel monter ce périphérique comme racine.
+      #
+      # Source de référence : outils/amorce/allopapa dans le dépôt. Il est copié
+      # dans initramfs8 par outils/reconditionner-initramfs.sh, et aussi posé dans
+      # /etc/initramfs-tools/scripts/local-top/ de la boîte (user-data), pour
+      # qu'une amorce régénérée sur la boîte le garde.
+      #
+      # La LED verte (ACT) parle quand rien d'autre ne le peut :
+      #   - battement de cœur (deux pulsations, une pause) : dépliage du système
+      #     au premier démarrage, de 8 à 40 minutes sur une carte lente ;
+      #   - trois éclats rapides puis une pause, sans fin : démarrage impossible.
+      #     La cause est écrite sur la carte, dans allo-papa-erreur-demarrage.txt.
+
+      PREREQ=""
+      prereqs() { echo "$PREREQ"; }
+      case "$1" in prereqs) prereqs; exit 0;; esac
+
+      . /scripts/functions
+
+      FICHIER=root.img
+      for ARG in $(cat /proc/cmdline); do
+        case "$ARG" in allopapa_image=*) FICHIER="${ARG#allopapa_image=}" ;; esac
+      done
+
+      # Montage de la carte : exactement celui de l'amorce éprouvée du 21/09.
+      # Le 06/10, des droits de groupe (gid=1000, fmask, dmask) et une table des
+      # montages par UUID avec nofail ont empêché le système de démarrer (cloud-init
+      # jamais lancé, aucun service, aucun son), sans trace. Ils ne servaient qu'à
+      # laisser le compte mathias écrire sur la FAT, ce dont on n'a pas besoin : la
+      # demande de transfert est déposée par `coffre.py demarrage`, lancé en root.
+      # NE PAS les réintroduire sans un essai sur le Raspberry.
+      OPTIONS_FAT="rw"
+      TRACE=allo-papa-erreur-demarrage.txt
+
+      # --------------------------------------------------------------- la LED
+      LED=""
+      for L in /sys/class/leds/ACT /sys/class/leds/led0; do
+        if [ -w "$L/trigger" ]; then LED="$L"; break; fi
+      done
+      LED_AVANT=""
+      LED_BOUCLE=""
+      if [ -n "$LED" ]; then
+        LED_AVANT="$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$LED/trigger" 2>/dev/null)"
+      fi
+
+      led_travail() {
+        [ -n "$LED" ] || return 0
+        if ! echo heartbeat > "$LED/trigger" 2>/dev/null; then
+          # Déclencheur absent du noyau : on clignote à la main.
+          echo none > "$LED/trigger" 2>/dev/null
+          ( while :; do
+              echo 1 > "$LED/brightness"; usleep 120000
+              echo 0 > "$LED/brightness"; usleep 120000
+              echo 1 > "$LED/brightness"; usleep 120000
+              echo 0 > "$LED/brightness"; usleep 900000
+            done ) &
+          LED_BOUCLE=$!
+        fi
+      }
+
+      led_normale() {
+        [ -n "$LED" ] || return 0
+        [ -n "$LED_BOUCLE" ] && kill "$LED_BOUCLE" 2>/dev/null
+        LED_BOUCLE=""
+        echo "${LED_AVANT:-mmc0}" > "$LED/trigger" 2>/dev/null
+      }
+
+      # Ne rend jamais la main : sans racine, il n'y a rien d'autre à faire que
+      # de le montrer. Une console de secours, sans écran ni clavier dans la
+      # boîte, ne serait vue par personne.
+      erreur_fatale() {
+        log_failure_msg "$1"
+        if [ -n "$CARTE" ] && [ -d /carte ]; then
+          {
+            echo "Allô Papa : la boîte n'a pas pu démarrer."
+            echo
+            echo "Cause : $1"
+            [ -n "$2" ] && echo "$2"
+            echo
+            echo "Que faire : remettre la carte dans l'ordinateur, ouvrir l'atelier"
+            echo "et renvoyer le système sur la carte, puis la remettre dans la boîte."
+            echo
+            echo "(secondes depuis l'allumage : $(cut -d' ' -f1 /proc/uptime 2>/dev/null))"
+          } > "/carte/$TRACE" 2>/dev/null
+          sync
+        fi
+        [ -n "$LED_BOUCLE" ] && kill "$LED_BOUCLE" 2>/dev/null
+        if [ -n "$LED" ]; then
+          echo none > "$LED/trigger" 2>/dev/null
+          while :; do
+            for _ in 1 2 3; do
+              echo 1 > "$LED/brightness"; usleep 150000
+              echo 0 > "$LED/brightness"; usleep 150000
+            done
+            usleep 1500000
+          done
+        fi
+        while :; do sleep 3600; done
+      }
+
+      log_begin_msg "Allo Papa : racine dans un fichier sur la carte"
+
+      # --------------------------------------------------------- trouver la carte
+      # Le premier périphérique qui se monte en FAT et porte cmdline.txt : c'est
+      # la partition de démarrage, quel que soit son nom (carte SD, clé USB).
+      mkdir -p /carte
+      CARTE=""
+      ESSAI=0
+      while [ "$ESSAI" -lt 30 ]; do
+        ESSAI=$((ESSAI + 1))
+        for PART in /dev/mmcblk0p1 /dev/mmcblk1p1 /dev/sda1 /dev/sdb1 /dev/nvme0n1p1; do
+          [ -b "$PART" ] || continue
+          if mount -t vfat -o "$OPTIONS_FAT" "$PART" /carte 2>/dev/null; then
+            if [ -f /carte/cmdline.txt ]; then
+              CARTE="$PART"
+              break
+            fi
+            umount /carte 2>/dev/null
+          fi
+        done
+        [ -n "$CARTE" ] && break
+        sleep 1
+      done
+
+      if [ -z "$CARTE" ]; then
+        erreur_fatale "partition FAT de démarrage introuvable (essais : $ESSAI)"
+      fi
+
+      # ------------------------------------------- premier démarrage : dépliage
+      # Le système voyage compressé : trois fois moins à écrire depuis le
+      # navigateur, qui est le maillon lent. On le déplie une seule fois, ici.
+      if [ ! -f "/carte/$FICHIER" ] && [ -f "/carte/$FICHIER.gz" ]; then
+        log_begin_msg "premier demarrage : depliage du systeme, patientez"
+
+        # Taille dépliée, lue dans les quatre derniers octets du .gz (exacte sous
+        # 4 Go, c'est le cas : FAT32 n'en accepte pas plus).
+        ATTENDU="$(tail -c 4 "/carte/$FICHIER.gz" 2>/dev/null | od -An -tu4 2>/dev/null | tr -d ' ')"
+        LIBRE_K="$(df -k /carte 2>/dev/null | tail -n 1 | awk '{print $4}')"
+        rm -f "/carte/$FICHIER.partiel"
+        if [ -n "$ATTENDU" ] && [ -n "$LIBRE_K" ] && \
+           [ "$((ATTENDU / 1024 + 65536))" -gt "$LIBRE_K" ]; then
+          erreur_fatale "carte trop pleine pour déplier le système" \
+            "Il faut $((ATTENDU / 1048576 + 64)) Mo libres, il en reste $((LIBRE_K / 1024))."
+        fi
+
+        led_travail
+        if gunzip -c "/carte/$FICHIER.gz" > "/carte/$FICHIER.partiel"; then
+          OBTENU="$(stat -c %s "/carte/$FICHIER.partiel" 2>/dev/null)"
+          if [ -n "$ATTENDU" ] && [ "$OBTENU" != "$ATTENDU" ]; then
+            rm -f "/carte/$FICHIER.partiel"; sync
+            erreur_fatale "système déplié incomplet ($OBTENU octets au lieu de $ATTENDU)"
+          fi
+          # Les données d'abord sur la carte, le renommage ensuite : une coupure
+          # entre les deux laisse un .partiel (refait au démarrage suivant), jamais
+          # un root.img de la bonne taille mais vide par endroits.
+          sync
+          mv "/carte/$FICHIER.partiel" "/carte/$FICHIER"
+          sync
+          rm -f "/carte/$FICHIER.gz"
+          sync
+          led_normale
+          log_end_msg
+        else
+          rm -f "/carte/$FICHIER.partiel"
+          sync
+          erreur_fatale "système compressé illisible ($FICHIER.gz abîmé ou incomplet)"
+        fi
+      fi
+
+      if [ ! -f "/carte/$FICHIER" ]; then
+        erreur_fatale "$FICHIER absent de la carte"
+      fi
+
+      modprobe loop 2>/dev/null
+      [ -b /dev/loop0 ] || mknod /dev/loop0 b 7 0 2>/dev/null
+      losetup /dev/loop0 "/carte/$FICHIER" || losetup -f "/carte/$FICHIER"
+
+      # La table des systèmes de fichiers de l'image d'origine désigne les
+      # partitions par un identifiant qui n'existe plus sur cette carte : la carte
+      # a été reformatée. On la réécrit avec la partition réellement trouvée, dans
+      # la forme exacte de l'amorce éprouvée (voir OPTIONS_FAT plus haut).
+      mkdir -p /racine
+      if mount -t ext4 /dev/loop0 /racine 2>/dev/null; then
+        cat > /racine/etc/fstab <<TABLE
+      proc            /proc           proc    defaults          0 0
+      $CARTE  /boot/firmware  vfat    defaults,flush    0 2
+      /dev/loop0      /               ext4    defaults,noatime  0 1
+      TABLE
+        # La partition FAT est le seul endroit où écrire ce que le créateur dépose,
+        # et le seul que son ordinateur sait relire.
+        mkdir -p /racine/boot/firmware
+        umount /racine
+      else
+        losetup -d /dev/loop0 2>/dev/null
+        erreur_fatale "$FICHIER ne s'ouvre pas (système abîmé)" \
+          "Effacer $FICHIER de la carte depuis l'ordinateur, puis renvoyer le système."
+      fi
+
+      # Démarrage réussi : une trace d'échec d'une fois précédente n'a plus lieu
+      # d'être.
+      rm -f "/carte/$TRACE"
+
+      log_end_msg
+      exit 0
+
+runcmd:
+  - [ sh, -c, "raspi-config nonint do_wifi_country FR || true" ]
+  # Le dossier personnel appartient à root après la création du compte par
+  # userconf.txt : sans ce rétablissement, l'utilisateur ne peut rien écrire
+  # chez lui.
+  - [ sh, -c, "install -d -o mathias -g mathias /home/mathias/allo_papa_enregistrement" ]
+  - [ sh, -c, "chown mathias:mathias /home/mathias" ]
+  # Les services viennent d'être écrits : systemd doit les relire.
+  - [ sh, -c, "systemctl daemon-reload" ]
+  - [ sh, -c, "systemctl enable allopapa-donnees.service allopapa-maintenance.service allopapa-preparation.service" ]
+  - [ sh, -c, "systemctl start allopapa-maintenance.service || true" ]
+  # La préparation tire le stockage des données (Wants=), déplie le système
+  # hors ligne et installe une version déjà déposée sur la carte.
+  - [ sh, -c, "systemctl start allopapa-preparation.service || true" ]

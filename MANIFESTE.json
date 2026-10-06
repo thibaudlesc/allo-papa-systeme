@@ -1,0 +1,218 @@
+{
+  "format": "allo-papa/systeme-boite",
+  "fichiers": [
+    {
+      "chemin": "LICENCE.broadcom",
+      "octets": 1594
+    },
+    {
+      "chemin": "bcm2710-rpi-2-b.dtb",
+      "octets": 32539
+    },
+    {
+      "chemin": "bcm2710-rpi-3-b-plus.dtb",
+      "octets": 35252
+    },
+    {
+      "chemin": "bcm2710-rpi-3-b.dtb",
+      "octets": 34731
+    },
+    {
+      "chemin": "bcm2710-rpi-cm0.dtb",
+      "octets": 33720
+    },
+    {
+      "chemin": "bcm2710-rpi-cm3.dtb",
+      "octets": 32302
+    },
+    {
+      "chemin": "bcm2710-rpi-zero-2-w.dtb",
+      "octets": 33708
+    },
+    {
+      "chemin": "bcm2710-rpi-zero-2.dtb",
+      "octets": 33708
+    },
+    {
+      "chemin": "bcm2711-rpi-4-b.dtb",
+      "octets": 56407
+    },
+    {
+      "chemin": "bcm2711-rpi-400.dtb",
+      "octets": 56411
+    },
+    {
+      "chemin": "bcm2711-rpi-cm4-io.dtb",
+      "octets": 39913
+    },
+    {
+      "chemin": "bcm2711-rpi-cm4.dtb",
+      "octets": 56928
+    },
+    {
+      "chemin": "bcm2711-rpi-cm4s.dtb",
+      "octets": 53824
+    },
+    {
+      "chemin": "bcm2712-d-rpi-5-b.dtb",
+      "octets": 78740
+    },
+    {
+      "chemin": "bcm2712-rpi-5-b.dtb",
+      "octets": 78740
+    },
+    {
+      "chemin": "bcm2712-rpi-500.dtb",
+      "octets": 78696
+    },
+    {
+      "chemin": "bcm2712-rpi-cm5-cm4io.dtb",
+      "octets": 79685
+    },
+    {
+      "chemin": "bcm2712-rpi-cm5-cm5io.dtb",
+      "octets": 79751
+    },
+    {
+      "chemin": "bcm2712-rpi-cm5l-cm4io.dtb",
+      "octets": 79726
+    },
+    {
+      "chemin": "bcm2712-rpi-cm5l-cm5io.dtb",
+      "octets": 79792
+    },
+    {
+      "chemin": "bcm2712d0-rpi-5-b.dtb",
+      "octets": 78744
+    },
+    {
+      "chemin": "bootcode.bin",
+      "octets": 52624
+    },
+    {
+      "chemin": "cmdline.txt",
+      "octets": 92
+    },
+    {
+      "chemin": "config.txt",
+      "octets": 1272
+    },
+    {
+      "chemin": "fixup.dat",
+      "octets": 7381
+    },
+    {
+      "chemin": "fixup4.dat",
+      "octets": 5512
+    },
+    {
+      "chemin": "fixup4cd.dat",
+      "octets": 3282
+    },
+    {
+      "chemin": "fixup4db.dat",
+      "octets": 8501
+    },
+    {
+      "chemin": "fixup4x.dat",
+      "octets": 8501
+    },
+    {
+      "chemin": "fixup_cd.dat",
+      "octets": 3282
+    },
+    {
+      "chemin": "fixup_db.dat",
+      "octets": 10348
+    },
+    {
+      "chemin": "fixup_x.dat",
+      "octets": 10348
+    },
+    {
+      "chemin": "initramfs8",
+      "octets": 15188639
+    },
+    {
+      "chemin": "issue.txt",
+      "octets": 145
+    },
+    {
+      "chemin": "kernel8.img",
+      "octets": 10192324
+    },
+    {
+      "chemin": "kernel_2712.img",
+      "octets": 10197590
+    },
+    {
+      "chemin": "network-config",
+      "octets": 1730
+    },
+    {
+      "chemin": "overlays/README",
+      "octets": 304661
+    },
+    {
+      "chemin": "overlays/dwc2.dtbo",
+      "octets": 801
+    },
+    {
+      "chemin": "overlays/nospi10.dtbo",
+      "octets": 267
+    },
+    {
+      "chemin": "overlays/vc4-kms-v3d.dtbo",
+      "octets": 2760
+    },
+    {
+      "chemin": "root.img.gz",
+      "octets": 802428770
+    },
+    {
+      "chemin": "start.elf",
+      "octets": 3022848
+    },
+    {
+      "chemin": "start4.elf",
+      "octets": 2298560
+    },
+    {
+      "chemin": "start4cd.elf",
+      "octets": 844156
+    },
+    {
+      "chemin": "start4db.elf",
+      "octets": 3796520
+    },
+    {
+      "chemin": "start4x.elf",
+      "octets": 3045800
+    },
+    {
+      "chemin": "start_cd.elf",
+      "octets": 844156
+    },
+    {
+      "chemin": "start_db.elf",
+      "octets": 4868488
+    },
+    {
+      "chemin": "start_x.elf",
+      "octets": 3769512
+    },
+    {
+      "chemin": "systeme.zip",
+      "octets": 80571840
+    },
+    {
+      "chemin": "user-data",
+      "octets": 50404
+    },
+    {
+      "chemin": "userconf.txt",
+      "octets": 115
+    }
+  ],
+  "octets": 942676140
+}
